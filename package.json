@@ -1,7 +1,7 @@
 {
   "name": "aruba-fe-client",
-  "version": "1.0.0",
-  "description": "Pure-HTTP client for Aruba Fatturazione Elettronica (Italian SDI passive invoices). Bypasses the 'deleghe utente' REST gate by reusing the web portal's Keycloak OIDC + advancedSearch endpoint.",
+  "version": "1.1.0",
+  "description": "Pure-HTTP client for Aruba Fatturazione Elettronica (Italian SDI received + sent invoices). Bypasses the 'deleghe utente' REST gate by reusing the web portal's Keycloak OIDC + advancedSearch endpoints.",
   "main": "src/index.cjs",
   "files": [
     "src/",

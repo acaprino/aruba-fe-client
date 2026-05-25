@@ -9,7 +9,7 @@
 // cross a fiscal-year rollover or a session re-issue don't read stale data.
 
 const { ENDPOINTS, APP_BASE } = require('./config.cjs');
-const { toFattura, parseArubaDate } = require('./models.cjs');
+const { toFattura, toFatturaSent, parseArubaDate } = require('./models.cjs');
 
 const SESSION_INFO_TTL_MS = 5 * 60 * 1000;
 
@@ -58,12 +58,9 @@ async function getVatCode(http) {
  * (from /api/session-info.fiscalYearList). The list includes future years
  * AND years before the account's activation — filter on the caller side.
  *
- * Typical pattern: filter <= current year, then use min() as the "from" year
- * for a full-history pull.
- *
  * @param {import('got').Got} http
- * @returns {Promise<number[]>} fiscal years as returned by Aruba (typically
- *   sorted DESC, e.g. [2028, 2027, ..., 2014])
+ * @returns {Promise<number[]>} fiscal years (typically sorted DESC, e.g.
+ *   [2028, 2027, ..., 2014])
  */
 async function getFiscalYearList(http) {
   const data = await getSessionInfo(http);
@@ -74,15 +71,16 @@ async function getFiscalYearList(http) {
   return list.map(Number).filter(Number.isFinite);
 }
 
-/**
- * @param {import('got').Got} http
- * @param {string} aruId  "ARUBA<P.IVA>"
- * @param {number} year
- * @returns {Promise<object[]>}  Raw Items as returned by Aruba (not mapped)
- */
-async function advancedSearch(http, aruId, year) {
+// ---------------------------------------------------------------------------
+// advancedSearch — passive (received) + sent (active). Same wire protocol on
+// both sides, only the endpoint URL changes. _runAdvancedSearch hosts the
+// shared HTTP code; the public wrappers exist so callers don't have to know
+// the URL.
+// ---------------------------------------------------------------------------
+
+async function _runAdvancedSearch(http, endpoint, aruId, year, fnLabel) {
   const payload = { PageNumber: 1, PageSize: null, AnnoFiscale: year };
-  const resp = await http.post(ENDPOINTS.advancedSearch, {
+  const resp = await http.post(endpoint, {
     json: payload,
     responseType: 'json',
     headers: {
@@ -97,74 +95,76 @@ async function advancedSearch(http, aruId, year) {
   });
   if (resp.statusCode !== 200) {
     const sample = typeof resp.body === 'string' ? resp.body.slice(0, 300) : JSON.stringify(resp.body).slice(0, 300);
-    throw new Error(`aruba-fe-client.advancedSearch year=${year} status=${resp.statusCode} body=${sample}`);
+    throw new Error(`aruba-fe-client.${fnLabel} year=${year} status=${resp.statusCode} body=${sample}`);
   }
   const items = resp.body && resp.body.Items;
   if (!Array.isArray(items)) {
-    throw new Error(`aruba-fe-client.advancedSearch year=${year}: Items is not an array`);
+    throw new Error(`aruba-fe-client.${fnLabel} year=${year}: Items is not an array`);
   }
   return items;
 }
 
 /**
- * Full orchestration: getVat -> advancedSearch per year -> toFattura ->
- * date filter -> dedup. Years are derived from [dateFrom, dateTo] with
- * yearsInRange. For a "full history" pull driven by getFiscalYearList, use
- * fetchFatturePassiveByYears() instead.
+ * Raw `advancedSearch` call for **received (passive)** invoices.
  *
  * @param {import('got').Got} http
- * @param {Date} dateFrom
- * @param {Date} dateTo
- * @param {object} [opts]
- * @param {object} [opts.logger]
- * @returns {Promise<{ fatture: object[], stats: { vat: string, years: number[], totalRaw: number, inRange: number, yearErrors: object[] } }>}
+ * @param {string} aruId  "ARUBA<P.IVA>"
+ * @param {number} year
+ * @returns {Promise<object[]>}  Raw Items as returned by Aruba (not mapped)
  */
-async function fetchFatturePassive(http, dateFrom, dateTo, opts = {}) {
-  const years = yearsInRange(dateFrom, dateTo);
-  return fetchFatturePassiveByYears(http, years, { dateFrom, dateTo, ...opts });
+async function advancedSearch(http, aruId, year) {
+  return _runAdvancedSearch(http, ENDPOINTS.advancedSearch, aruId, year, 'advancedSearch');
 }
 
 /**
- * Like fetchFatturePassive, but the year list is explicit (use this with
- * getFiscalYearList for full-history pulls without hardcoding the start year).
- * The date filter still applies when dateFrom/dateTo are provided; otherwise
- * all Items in the queried years are kept.
+ * Raw `advancedSearch` call for **sent (active)** invoices.
+ *
+ * Same wire format as `advancedSearch` but against
+ * `/services/FatturaInviataFrontEnd/advancedSearch`. The Item shape is the
+ * symmetrical one — the counterparty field is `Destinatario` instead of
+ * `Mittente`. Use `toFatturaSent` from models.cjs to map.
  *
  * @param {import('got').Got} http
- * @param {number[]} years
- * @param {object} [opts]
- * @param {Date} [opts.dateFrom]
- * @param {Date} [opts.dateTo]
- * @param {object} [opts.logger]
+ * @param {string} aruId  "ARUBA<P.IVA>"
+ * @param {number} year
+ * @returns {Promise<object[]>}
  */
-async function fetchFatturePassiveByYears(http, years, opts = {}) {
+async function advancedSearchSent(http, aruId, year) {
+  return _runAdvancedSearch(http, ENDPOINTS.advancedSearchSent, aruId, year, 'advancedSearchSent');
+}
+
+// ---------------------------------------------------------------------------
+// fetch orchestrators — both directions share the loop logic
+// (getVat -> per-year search -> map -> date filter -> dedup -> sort).
+// _fetchByYears parameterizes the search fn + the Item->Fattura mapper.
+// ---------------------------------------------------------------------------
+
+async function _fetchByYears(http, years, opts, { searchFn, mapFn, fnLabel }) {
   const log = opts.logger || { info: () => {}, debug: () => {}, warn: () => {} };
   const vat = await getVatCode(http);
   const aruId = `ARUBA${vat}`;
-  log.info({ vat, years }, 'years_to_query');
+  log.info({ vat, years, mode: fnLabel }, 'years_to_query');
 
   let totalRaw = 0;
   const seen = new Set();
   const fatture = [];
-  // Collect per-year errors instead of aborting the whole pull. A 502 on
-  // year N would otherwise lose progress on year N+1; with per-year capture
-  // each year stands alone.
+  // Per-year error capture so a 502 on one year doesn't abort the whole pull.
   const yearErrors = [];
   const { dateFrom, dateTo } = opts;
 
   for (const year of years) {
     let items;
     try {
-      items = await advancedSearch(http, aruId, year);
+      items = await searchFn(http, aruId, year);
     } catch (err) {
-      log.warn({ year, message: err.message }, 'advanced_search_failed');
+      log.warn({ year, message: err.message, mode: fnLabel }, 'advanced_search_failed');
       yearErrors.push({ year, message: err.message, code: err.aruba_error_code || null });
       continue;
     }
     totalRaw += items.length;
-    log.info({ year, count: items.length }, 'advanced_search_done');
+    log.info({ year, count: items.length, mode: fnLabel }, 'advanced_search_done');
     for (const item of items) {
-      const f = toFattura(item);
+      const f = mapFn(item);
       if (!f) continue;
       const d = parseArubaDate(item.Data);
       if (!d) continue;
@@ -189,25 +189,75 @@ function yearsInRange(dateFrom, dateTo) {
 }
 
 /**
- * Fetch the full FatturaPA XML for a single received invoice.
+ * Full orchestration for **received (passive)** invoices: getVat ->
+ * advancedSearch per year -> toFattura -> date filter -> dedup. Years are
+ * derived from [dateFrom, dateTo]. For a "full history" pull driven by
+ * getFiscalYearList, use `fetchFatturePassiveByYears`.
  *
- * Uses the internal portal endpoint /services/FatturaRicevutaFrontEnd/ExtractXmlInvoiceReceived
- * (discovered via Playwright network sniff, May 2026). Same auth model as
- * advancedSearch: Aru-Sub / Aru-Delegator = ARUBA<P.IVA>, session cookie
- * from login().
- *
- * The response wraps the XML in { Content: <base64> }. Callers decode and
- * parse (see parseFatturaPa).
+ * Each Fattura has `direzione: 'passiva'`.
  *
  * @param {import('got').Got} http
- * @param {string} aruId  "ARUBA<P.IVA>"
- * @param {string} idAruba  MongoDB ObjectId from Fattura.id_aruba
- * @param {number} anno  Fiscal year (Fattura.data year)
- * @returns {Promise<string>}  Decoded UTF-8 FatturaPA XML
+ * @param {Date} dateFrom
+ * @param {Date} dateTo
+ * @param {object} [opts]
+ * @param {object} [opts.logger]
+ * @returns {Promise<{ fatture: object[], stats: { vat, years, totalRaw, inRange, yearErrors } }>}
  */
-async function extractXmlInvoiceReceived(http, aruId, idAruba, anno) {
+async function fetchFatturePassive(http, dateFrom, dateTo, opts = {}) {
+  const years = yearsInRange(dateFrom, dateTo);
+  return fetchFatturePassiveByYears(http, years, { dateFrom, dateTo, ...opts });
+}
+
+/**
+ * Like fetchFatturePassive, but the year list is explicit.
+ */
+async function fetchFatturePassiveByYears(http, years, opts = {}) {
+  return _fetchByYears(http, years, opts, {
+    searchFn: advancedSearch,
+    mapFn: toFattura,
+    fnLabel: 'passive',
+  });
+}
+
+/**
+ * Full orchestration for **sent (active)** invoices. Symmetrical to
+ * `fetchFatturePassive` but against `FatturaInviataFrontEnd/advancedSearch`.
+ * Each Fattura has `direzione: 'attiva'` and the counterparty fields
+ * (`controparte_*`) are sourced from `Destinatario` / `CodicePrimario`
+ * instead of `Mittente`.
+ *
+ * @param {import('got').Got} http
+ * @param {Date} dateFrom
+ * @param {Date} dateTo
+ * @param {object} [opts]
+ * @param {object} [opts.logger]
+ */
+async function fetchFattureAttive(http, dateFrom, dateTo, opts = {}) {
+  const years = yearsInRange(dateFrom, dateTo);
+  return fetchFattureAttiveByYears(http, years, { dateFrom, dateTo, ...opts });
+}
+
+/**
+ * Like fetchFattureAttive, but the year list is explicit.
+ */
+async function fetchFattureAttiveByYears(http, years, opts = {}) {
+  return _fetchByYears(http, years, opts, {
+    searchFn: advancedSearchSent,
+    mapFn: toFatturaSent,
+    fnLabel: 'attive',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Single-invoice XML extraction. Same protocol both sides:
+//   POST <endpoint> { Id, AnnoFiscale } -> { Content: <base64 XML> }
+// _runExtractXml hosts the shared HTTP code; public wrappers pick the
+// endpoint URL (and let advanced callers override it).
+// ---------------------------------------------------------------------------
+
+async function _runExtractXml(http, endpoint, aruId, idAruba, anno, fnLabel) {
   const payload = { Id: String(idAruba), AnnoFiscale: Number(anno) };
-  const resp = await http.post(ENDPOINTS.extractXmlReceived, {
+  const resp = await http.post(endpoint, {
     json: payload,
     responseType: 'json',
     headers: {
@@ -222,21 +272,68 @@ async function extractXmlInvoiceReceived(http, aruId, idAruba, anno) {
   });
   if (resp.statusCode !== 200) {
     const sample = typeof resp.body === 'string' ? resp.body.slice(0, 300) : JSON.stringify(resp.body).slice(0, 300);
-    throw new Error(`aruba-fe-client.extractXmlInvoiceReceived id=${idAruba} status=${resp.statusCode} body=${sample}`);
+    throw new Error(`aruba-fe-client.${fnLabel} id=${idAruba} status=${resp.statusCode} body=${sample}`);
   }
   const content = resp.body && resp.body.Content;
   if (!content || typeof content !== 'string') {
-    throw new Error(`aruba-fe-client.extractXmlInvoiceReceived id=${idAruba}: Content missing or not a string`);
+    throw new Error(`aruba-fe-client.${fnLabel} id=${idAruba}: Content missing or not a string`);
   }
   return Buffer.from(content, 'base64').toString('utf8');
 }
 
+/**
+ * Fetch the full FatturaPA XML for a single **received (passive)** invoice.
+ *
+ * Uses /services/FatturaRicevutaFrontEnd/ExtractXmlInvoiceReceived (discovered
+ * via Playwright sniff, May 2026). Same auth as advancedSearch.
+ *
+ * @param {import('got').Got} http
+ * @param {string} aruId  "ARUBA<P.IVA>"
+ * @param {string} idAruba  MongoDB ObjectId from Fattura.id_aruba
+ * @param {number} anno  Fiscal year
+ * @returns {Promise<string>}  Decoded UTF-8 FatturaPA XML
+ */
+async function extractXmlInvoiceReceived(http, aruId, idAruba, anno) {
+  return _runExtractXml(http, ENDPOINTS.extractXmlReceived, aruId, idAruba, anno, 'extractXmlInvoiceReceived');
+}
+
+/**
+ * Fetch the full FatturaPA XML for a single **sent (active)** invoice.
+ *
+ * Uses /services/FatturaInviataFrontEnd/ExtractXmlInvoiceSent by symmetry
+ * with the received side. If a deployment finds that Aruba uses a different
+ * verb on the sent endpoint, pass `opts.endpoint` to override:
+ *
+ *   extractXmlInvoiceSent(http, aruId, idAruba, anno, {
+ *     endpoint: 'https://fatturazioneelettronica.aruba.it/services/FatturaInviataFrontEnd/<real-verb>',
+ *   })
+ *
+ * @param {import('got').Got} http
+ * @param {string} aruId  "ARUBA<P.IVA>"
+ * @param {string} idAruba  MongoDB ObjectId from Fattura.id_aruba
+ * @param {number} anno  Fiscal year
+ * @param {{ endpoint?: string }} [opts]
+ * @returns {Promise<string>}  Decoded UTF-8 FatturaPA XML
+ */
+async function extractXmlInvoiceSent(http, aruId, idAruba, anno, opts = {}) {
+  const endpoint = opts.endpoint || ENDPOINTS.extractXmlSent;
+  return _runExtractXml(http, endpoint, aruId, idAruba, anno, 'extractXmlInvoiceSent');
+}
+
 module.exports = {
+  // Session / metadata
   getSessionInfo,
   getVatCode,
   getFiscalYearList,
+  // Low-level search
   advancedSearch,
+  advancedSearchSent,
+  // High-level fetchers
   fetchFatturePassive,
   fetchFatturePassiveByYears,
+  fetchFattureAttive,
+  fetchFattureAttiveByYears,
+  // Single-invoice XML extraction
   extractXmlInvoiceReceived,
+  extractXmlInvoiceSent,
 };

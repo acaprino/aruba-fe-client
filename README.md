@@ -1,6 +1,6 @@
 # aruba-fe-client
 
-Pure-HTTP client for **Aruba Fatturazione Elettronica** — downloads received (passive) invoice metadata and full FatturaPA XML from the Italian SDI workflow without requiring the gated "deleghe utente" REST API.
+Pure-HTTP client for **Aruba Fatturazione Elettronica** — downloads metadata and full FatturaPA XML for **both received (passive) and sent (active) invoices** from the Italian SDI workflow, without requiring the gated "deleghe utente" REST API.
 
 The library reuses the same Keycloak OIDC login + internal `advancedSearch` endpoint that the Aruba web portal uses, so the same web credentials that work for `fatturazioneelettronica.aruba.it` work here.
 
@@ -72,6 +72,32 @@ const usable = allYears.filter((y) => y <= new Date().getFullYear() && y >= 2019
 const { fatture } = await fetchFatturePassiveByYears(http, usable);
 ```
 
+### Sent (active) invoices
+
+Symmetrical API to the passive one — same shape, just different functions:
+
+```js
+const {
+  login,
+  fetchFattureAttive,
+  fetchFattureAttiveByYears,
+} = require('aruba-fe-client');
+
+const { http } = await login({ username, password });
+
+// Date-range version
+const { fatture } = await fetchFattureAttive(
+  http,
+  new Date('2026-01-01'),
+  new Date('2026-05-31'),
+);
+
+console.log(fatture[0].direzione);     // 'attiva'
+console.log(fatture[0].controparte);   // counterparty (customer name)
+```
+
+The Fattura shape is identical for both directions; the discriminator is the `direzione` field (`'passiva' | 'attiva'`). Counterparty data lives in the unified `controparte`, `controparte_piva`, `controparte_cf` fields — for a passive invoice the supplier (cedente), for an active invoice the customer (cessionario).
+
 ### Download a single FatturaPA XML
 
 ```js
@@ -79,6 +105,7 @@ const {
   login,
   getVatCode,
   extractXmlInvoiceReceived,
+  extractXmlInvoiceSent,
   parseFatturaPa,
 } = require('aruba-fe-client');
 
@@ -86,8 +113,15 @@ const { http } = await login({ username, password });
 const vat = await getVatCode(http);
 const aruId = `ARUBA${vat}`;
 
-const xml = await extractXmlInvoiceReceived(http, aruId, idAruba, 2026);
-const { voci, causale, dati_pagamento } = parseFatturaPa(xml);
+// Passive (received) invoice — fully verified
+const xmlIn = await extractXmlInvoiceReceived(http, aruId, idAruba, 2026);
+const { voci, causale, dati_pagamento } = parseFatturaPa(xmlIn);
+
+// Active (sent) invoice — endpoint URL inferred by symmetry. If your account
+// finds Aruba uses a different verb, override per call:
+const xmlOut = await extractXmlInvoiceSent(http, aruId, idAruba, 2026);
+// or:
+// extractXmlInvoiceSent(http, aruId, idAruba, 2026, { endpoint: 'https://.../<real-verb>' })
 ```
 
 ## API reference
@@ -131,6 +165,14 @@ Iterates fiscal years overlapping `[dateFrom, dateTo]`, calls `advancedSearch` p
 
 Same shape, but the year list is explicit instead of derived from a date range. Use with `getFiscalYearList` for full-history pulls.
 
+### `fetchFattureAttive(http, dateFrom, dateTo, opts?)` → `{ fatture, stats }`
+
+Same signature and return shape as `fetchFatturePassive`, but hits `FatturaInviataFrontEnd/advancedSearch` instead. Each returned Fattura has `direzione: 'attiva'` and counterparty data sourced from `Destinatario` (the customer) instead of `Mittente`.
+
+### `fetchFattureAttiveByYears(http, years, opts?)` → `{ fatture, stats }`
+
+Explicit-year variant of `fetchFattureAttive`.
+
 ### `getFiscalYearList(http)` → `number[]`
 
 Returns the queryable fiscal years Aruba reports for the account (from `/api/session-info.fiscalYearList`).
@@ -145,13 +187,21 @@ Returns the P.IVA of the logged-in account.
 
 ### `advancedSearch(http, aruId, year)` → `Item[]`
 
-Low-level call. Returns the raw `Items` array from Aruba so callers can access fields not surfaced by `toFattura` (e.g. `AbilitaCreazioneNotaCredito`, `VolumeAffari`, `StatoPagInc`).
+Low-level call for **received (passive)** invoices. Returns the raw `Items` array from Aruba so callers can access fields not surfaced by `toFattura` (e.g. `AbilitaCreazioneNotaCredito`, `VolumeAffari`, `StatoPagInc`).
 
 `aruId` must be `ARUBA<P.IVA>` (no separator).
+
+### `advancedSearchSent(http, aruId, year)` → `Item[]`
+
+Same call against `FatturaInviataFrontEnd/advancedSearch` for **sent (active)** invoices. Same wire format; the counterparty field in each Item is `Destinatario` instead of `Mittente`.
 
 ### `extractXmlInvoiceReceived(http, aruId, idAruba, anno)` → `string`
 
 Retrieves the complete FatturaPA XML for a single received invoice via the internal `POST /services/FatturaRicevutaFrontEnd/ExtractXmlInvoiceReceived` endpoint. Returns the decoded UTF-8 XML (Aruba wraps it in `{ Content: <base64> }`; this function unwraps and decodes).
+
+### `extractXmlInvoiceSent(http, aruId, idAruba, anno, opts?)` → `string`
+
+Symmetric call for a sent (active) invoice. Defaults to `POST /services/FatturaInviataFrontEnd/ExtractXmlInvoiceSent` (inferred from the received-side naming; if your account finds a different verb in use, override via `opts.endpoint`).
 
 ### `parseFatturaPa(xml)` → `{ voci, causale, dati_pagamento }`
 
@@ -187,9 +237,17 @@ type Fattura = {
   id_aruba: string;             // MongoDB ObjectId internal to Aruba
   numero: string;
   data: string;                 // YYYY-MM-DD (UTC-anchored, see note below)
-  mittente: string | null;
-  cedente_piva: string | null;
-  cedente_cf: string | null;
+
+  // Direction discriminator. Lets a caller mix passive + active Fatture
+  // in a single collection and tell them apart.
+  direzione: 'passiva' | 'attiva';
+
+  // Unified counterparty fields. For passive invoices this is the supplier
+  // (cedente); for active invoices the customer (cessionario).
+  controparte: string | null;
+  controparte_piva: string | null;
+  controparte_cf: string | null;
+
   tipo_documento: 'TD01'|'TD02'|'TD04'|'TD24'|... | null;
   formato_trasmissione: 'FPR12'|'FPA12' | null;
   importo_totale: number | null;
@@ -227,8 +285,8 @@ type Fattura = {
 
 | Limit | Impact | Workaround |
 |---|---|---|
-| **Metadata-only in search results** | `advancedSearch` returns no XML body | Use `extractXmlInvoiceReceived` per-invoice (on-demand) |
-| **Passive (received) invoices only** | No active (issued) invoices | An analogous endpoint exists — `FatturaInviataFrontEnd/advancedSearch` — but isn't implemented here yet |
+| **Metadata-only in search results** | `advancedSearch` / `advancedSearchSent` return no XML body | Use `extractXmlInvoiceReceived` / `extractXmlInvoiceSent` per-invoice (on-demand) |
+| **`extractXmlInvoiceSent` endpoint is inferred** | Default URL is `FatturaInviataFrontEnd/ExtractXmlInvoiceSent` by symmetry with the received side. Verified verb on the **received** endpoint; the **sent** verb is unconfirmed | If a 404 / "method not found" hits, sniff the real verb in DevTools on the portal's "Fatture inviate" tab and pass it via `opts.endpoint`. Open an issue once you know the real URL so the default can be corrected |
 | **No 2FA/OTP** | If the account has 2FA enabled, login fails | Disable 2FA on the sync account, or use a session-cookie capture flow |
 | **`STATO_CODE_MAP` limited** | Only codes 1 and 2 map to `consegnata`. Other states resolve to `sconosciuto` but `stato_code` is preserved | Extend the map in `src/models.cjs` as new codes appear |
 | **Server filters by fiscal year only** | A cross-year range = N HTTP calls (slow) | Inherent to the portal; minimize lookback window where possible |

@@ -9,8 +9,16 @@ const KC_BASE = 'https://loginfatturazione.aruba.it';
 const ENDPOINTS = Object.freeze({
   appRoot: `${APP_BASE}/`,
   sessionInfo: `${APP_BASE}/api/session-info`,
+  // Received (passive) invoices — verified in production.
   advancedSearch: `${APP_BASE}/services/FatturaRicevutaFrontEnd/advancedSearch`,
   extractXmlReceived: `${APP_BASE}/services/FatturaRicevutaFrontEnd/ExtractXmlInvoiceReceived`,
+  // Sent (active) invoices — `advancedSearchSent` is the endpoint the portal
+  // calls on the "Fatture inviate" tab. `extractXmlSent` is inferred by
+  // symmetry with the received side; if Aruba uses a different verb, the
+  // caller can override per-call via the `endpoint` opt on
+  // extractXmlInvoiceSent.
+  advancedSearchSent: `${APP_BASE}/services/FatturaInviataFrontEnd/advancedSearch`,
+  extractXmlSent: `${APP_BASE}/services/FatturaInviataFrontEnd/ExtractXmlInvoiceSent`,
   oidcTrigger: `${APP_BASE}/api/oauth2/authorization/gateway`,
 });
 

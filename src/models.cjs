@@ -1,6 +1,20 @@
 // src/models.cjs
 // Pure-data mappers: Aruba `Item` envelope from advancedSearch -> `Fattura`
 // shape, plus the Aruba date parser. No external dependencies.
+//
+// There are two mapper variants because the portal's two sides use
+// asymmetric field names for the counterparty:
+//
+//   - Received (passive) Item:  Mittente      = counterparty (supplier)
+//   - Sent (active)     Item:  Destinatario   = counterparty (customer)
+//
+// Both mappers produce the same Fattura shape, with a `direzione` discriminator
+// ('passiva' | 'attiva') and unified `controparte_*` fields.
+
+const Direzione = Object.freeze({
+  PASSIVA: 'passiva',
+  ATTIVA: 'attiva',
+});
 
 const StatoSDI = Object.freeze({
   CONSEGNATA: 'consegnata',
@@ -45,18 +59,29 @@ function normalizeTz(tz) {
   return tz;
 }
 
-function toFattura(item) {
+// Shared core mapper. Both toFattura and toFatturaSent funnel through this.
+// `counterpartyName` is the Item field that carries the counterparty
+// denomination ("Mittente" for passive, "Destinatario" for active). The
+// CodicePrimario / CodiceSecondario fields hold the counterparty VAT and CF
+// on both sides — Aruba consistently uses these as "the other party"
+// regardless of direction.
+function _toFatturaCore(item, direzione, counterpartyName) {
   if (!item || typeof item !== 'object' || !item.Id || !item.Numero || !item.Data) return null;
   const dataEmissione = parseArubaDate(item.Data);
   if (!dataEmissione) return null;
+
+  const controparte = nullable(item[counterpartyName]);
+  const controparte_piva = nullable(item.CodicePrimario);
+  const controparte_cf = nullable(item.CodiceSecondario);
 
   return {
     id_aruba: String(item.Id),
     numero: String(item.Numero),
     data: ymd(dataEmissione),
-    mittente: nullable(item.Mittente),
-    cedente_piva: nullable(item.CodicePrimario),
-    cedente_cf: nullable(item.CodiceSecondario),
+    direzione,
+    controparte,
+    controparte_piva,
+    controparte_cf,
     tipo_documento: nullable(item.Tipo),
     formato_trasmissione: nullable(item.FormatoTrasmissione),
     importo_totale: numNullable(item.TotaleDocumento),
@@ -74,6 +99,26 @@ function toFattura(item) {
     importata: Boolean(item.Importata),
     allegati: Boolean(item.Allegati),
   };
+}
+
+/**
+ * Map a raw Item from `advancedSearch` (received / passive invoices) to a
+ * Fattura with `direzione: 'passiva'`. Returns null on malformed input.
+ */
+function toFattura(item) {
+  return _toFatturaCore(item, Direzione.PASSIVA, 'Mittente');
+}
+
+/**
+ * Map a raw Item from `advancedSearchSent` (sent / active invoices) to a
+ * Fattura with `direzione: 'attiva'`. Returns null on malformed input.
+ *
+ * The Aruba portal uses `Destinatario` as the counterparty denomination on
+ * the sent tab; CodicePrimario / CodiceSecondario still hold the counterparty
+ * VAT and CF.
+ */
+function toFatturaSent(item) {
+  return _toFatturaCore(item, Direzione.ATTIVA, 'Destinatario');
 }
 
 function nullable(v) {
@@ -97,4 +142,11 @@ function ymd(d) {
   return `${y}-${m}-${day}`;
 }
 
-module.exports = { StatoSDI, statoFromCode, parseArubaDate, toFattura };
+module.exports = {
+  StatoSDI,
+  Direzione,
+  statoFromCode,
+  parseArubaDate,
+  toFattura,
+  toFatturaSent,
+};

@@ -4,7 +4,14 @@
 
 const assert = require('node:assert/strict');
 
-const { toFattura, parseArubaDate, statoFromCode, StatoSDI } = require('../src/models.cjs');
+const {
+  toFattura,
+  toFatturaSent,
+  parseArubaDate,
+  statoFromCode,
+  StatoSDI,
+  Direzione,
+} = require('../src/models.cjs');
 
 let pass = 0, fail = 0;
 function test(label, fn) {
@@ -79,15 +86,16 @@ const RAW_ITEM = {
 
   console.log('\n== toFattura ==');
 
-  await test('maps a full Item to the Fattura shape', () => {
+  await test('maps a full Item to the Fattura shape (passive)', () => {
     const f = toFattura(RAW_ITEM);
     assert.ok(f);
     assert.equal(f.id_aruba, '6a04b9861234567890abcdef');
     assert.equal(f.numero, 'F12345');
     assert.equal(f.data, '2026-05-13'); // UTC YYYY-MM-DD
-    assert.equal(f.mittente, 'Wind Tre S.p.A.');
-    assert.equal(f.cedente_piva, 'IT12345678901');
-    assert.equal(f.cedente_cf, 'CF-12345678901');
+    assert.equal(f.direzione, Direzione.PASSIVA);
+    assert.equal(f.controparte, 'Wind Tre S.p.A.');
+    assert.equal(f.controparte_piva, 'IT12345678901');
+    assert.equal(f.controparte_cf, 'CF-12345678901');
     assert.equal(f.tipo_documento, 'TD01');
     assert.equal(f.formato_trasmissione, 'FPR12');
     assert.equal(f.importo_totale, 44.41);
@@ -122,10 +130,80 @@ const RAW_ITEM = {
   await test('nullable / numNullable handle missing fields gracefully', () => {
     const minimal = { Id: 'x', Numero: 'y', Data: '2026/05/13 12:00:00+00:00' };
     const f = toFattura(minimal);
-    assert.equal(f.mittente, null);
-    assert.equal(f.cedente_piva, null);
+    assert.equal(f.controparte, null);
+    assert.equal(f.controparte_piva, null);
+    assert.equal(f.controparte_cf, null);
     assert.equal(f.importo_totale, null);
     assert.equal(f.totale_iva, null);
+  });
+
+  console.log('\n== toFatturaSent (active invoices) ==');
+
+  // Symmetrical fixture: counterparty denomination is in `Destinatario`
+  // (not `Mittente`), VAT and CF still in CodicePrimario / CodiceSecondario.
+  const RAW_ITEM_SENT = {
+    Id: 'a1b2c3d4e5f6789012345678',
+    Numero: '2026/F001',
+    Data: '2026/05/13 10:00:00.0000+02:00',
+    Destinatario: 'Cliente S.r.l.',
+    CodicePrimario: 'IT09876543210',
+    CodiceSecondario: 'CF-09876543210',
+    Tipo: 'TD01',
+    FormatoTrasmissione: 'FPR12',
+    TotaleDocumento: 1220,
+    TotaleImponibile: 1000,
+    TotaleIva: 220,
+    NettoAPagare: 1220,
+    Stato: 1,
+    IdSdi: 'SDI-99999',
+    SdiFileName: 'IT06628860964_00001.xml',
+    Conservato: false,
+    Importata: false,
+    Allegati: false,
+  };
+
+  await test('maps a sent Item to the Fattura shape', () => {
+    const f = toFatturaSent(RAW_ITEM_SENT);
+    assert.ok(f);
+    assert.equal(f.id_aruba, 'a1b2c3d4e5f6789012345678');
+    assert.equal(f.numero, '2026/F001');
+    assert.equal(f.data, '2026-05-13');
+    assert.equal(f.direzione, Direzione.ATTIVA);
+    // Counterparty sourced from Destinatario, not Mittente
+    assert.equal(f.controparte, 'Cliente S.r.l.');
+    assert.equal(f.controparte_piva, 'IT09876543210');
+    assert.equal(f.controparte_cf, 'CF-09876543210');
+    // Totals and SDI metadata still mapped
+    assert.equal(f.importo_totale, 1220);
+    assert.equal(f.totale_imponibile, 1000);
+    assert.equal(f.totale_iva, 220);
+    assert.equal(f.id_sdi, 'SDI-99999');
+    assert.equal(f.stato_sdi, StatoSDI.CONSEGNATA);
+  });
+
+  await test('Destinatario missing yields null controparte (not crash)', () => {
+    const item = { ...RAW_ITEM_SENT, Destinatario: undefined };
+    const f = toFatturaSent(item);
+    assert.equal(f.controparte, null);
+    assert.equal(f.direzione, Direzione.ATTIVA);
+  });
+
+  await test('toFatturaSent inherits the same null-on-malformed contract', () => {
+    assert.equal(toFatturaSent(null), null);
+    assert.equal(toFatturaSent({}), null);
+    assert.equal(toFatturaSent({ Id: 'x', Numero: 'y' }), null);
+    assert.equal(toFatturaSent({ ...RAW_ITEM_SENT, Data: 'not-a-date' }), null);
+  });
+
+  await test('passive vs active produce different direzione for same Id', () => {
+    // Same Item structure put through both mappers — proves the discriminator
+    // is wired correctly without false coupling.
+    const passiveLike = { ...RAW_ITEM_SENT, Mittente: 'Same', Destinatario: undefined };
+    const activeLike = { ...RAW_ITEM_SENT, Mittente: undefined, Destinatario: 'Same' };
+    assert.equal(toFattura(passiveLike).direzione, Direzione.PASSIVA);
+    assert.equal(toFatturaSent(activeLike).direzione, Direzione.ATTIVA);
+    assert.equal(toFattura(passiveLike).controparte, 'Same');
+    assert.equal(toFatturaSent(activeLike).controparte, 'Same');
   });
 
   console.log(`\n  ${pass} passed, ${fail} failed`);

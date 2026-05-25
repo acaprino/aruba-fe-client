@@ -37,6 +37,20 @@ For the on-demand XML extraction (step 7+):
 
 Endpoint #7 isn't documented anywhere — it was discovered by sniffing the portal's network traffic with Playwright (May 2026) while the operator clicked the "view invoice" button. The auth model is the same as `advancedSearch`.
 
+### Sent (active) invoices
+
+Same flow, different endpoints. Steps 1-4 are identical (login + session-info). Steps 5-9 use the `FatturaInviataFrontEnd` namespace:
+
+```
+5'. POST /services/FatturaInviataFrontEnd/advancedSearch         (verified)
+6'. Items[] → toFatturaSent() — counterparty in `Destinatario`
+7'. POST /services/FatturaInviataFrontEnd/ExtractXmlInvoiceSent  (inferred)
+```
+
+The `advancedSearchSent` endpoint is the one the portal calls on the "Fatture inviate" tab — confirmed. The XML-extraction verb on the sent side is **inferred by symmetry** with the received endpoint (`ExtractXmlInvoiceReceived` → `ExtractXmlInvoiceSent`). Until someone confirms it against a real account, treat `extractXmlInvoiceSent` as best-effort: the function accepts an `opts.endpoint` override so callers who sniff the real verb can swap it without patching the library.
+
+The Item shape on the sent side is symmetrical: counterparty denomination lives in `Destinatario` instead of `Mittente`, while `CodicePrimario` / `CodiceSecondario` keep their meaning (counterparty VAT / CF). `toFatturaSent` handles the rename and tags the Fattura with `direzione: 'attiva'`. The Fattura shape is otherwise identical to the passive one — same `controparte`, `controparte_piva`, `controparte_cf` field names, so a caller can collect both directions into the same store and discriminate on `direzione` alone.
+
 ## Design decisions
 
 ### Why scrape instead of using the official REST API
@@ -98,8 +112,8 @@ Backlog for when requirements or problems emerge:
 
 - **[H] Cookie-jar cache hook** — the library doesn't ship caching to avoid mandating a storage backend, but a `cacheAdapter` option (`{ get(key), set(key, value, ttl) }`) would let callers persist `cookieJar.toJSON()` with their own encryption. Saves one Keycloak login per sync (~2-3s).
 - **[H] Extended `STATO_CODE_MAP`** — only codes 1 and 2 map to `consegnata`. Other states resolve to `sconosciuto` but `stato_code` is preserved in the `Fattura`. Extend `src/models.cjs::STATO_CODE_MAP` as new codes appear in real data.
-- **[M] Issued invoices (fatture attive)** — `FatturaInviataFrontEnd/advancedSearch` exists with the same pattern. Use case: cross-check issued invoices against receipts. Not implemented today.
-- **[M] Retry with backoff on 5xx** — `advancedSearch` has no built-in retry on POST. A single retry with jitter on 502/503/504 would absorb transient blips. Must respect Aruba's anti-bot posture (no observed rate limit today, but Akamai is in the path).
+- **[H] Confirm the `extractXmlInvoiceSent` URL** — the verb is inferred from the received-side naming. Until verified live against a real account, callers should be prepared to override `opts.endpoint`. Once confirmed (or corrected), update the default in `config.cjs::ENDPOINTS.extractXmlSent`.
+- **[M] Retry with backoff on 5xx** — `advancedSearch` / `advancedSearchSent` have no built-in retry on POST. A single retry with jitter on 502/503/504 would absorb transient blips. Must respect Aruba's anti-bot posture (no observed rate limit today, but Akamai is in the path).
 - **[L] `curl-impersonate` fallback** — if Akamai introduces TLS-fingerprint bot detection, swap `got` for `curl-impersonate-node`. A compatible wrapper would live in `getGot.cjs`.
 - **[L] CAPTCHA detection** — if `Keycloak login form not found` recurs, parse the error HTML more carefully to distinguish "CAPTCHA required" from "template changed".
 
@@ -130,7 +144,7 @@ aruba-fe-client/
 │   └── index.cjs                Public barrel
 ├── tests/
 │   ├── fatturaPaParser.test.cjs 7 cases — XML parser edge cases
-│   └── models.test.cjs          10 cases — Item mapper + date parser + UTC ymd
+│   └── models.test.cjs          14 cases — Item mapper (passive + active) + date parser + UTC ymd
 ├── docs/
 │   └── ARCHITECTURE.md          This file
 ├── README.md                    Quick start + API reference + failure modes
