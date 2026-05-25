@@ -117,18 +117,7 @@ Backlog for when requirements or problems emerge:
 - **[L] `curl-impersonate` fallback** — if Akamai introduces TLS-fingerprint bot detection, swap `got` for `curl-impersonate-node`. A compatible wrapper would live in `getGot.cjs`.
 - **[L] CAPTCHA detection** — if `Keycloak login form not found` recurs, parse the error HTML more carefully to distinguish "CAPTCHA required" from "template changed".
 
-## Comparison with the official REST client
-
-| Aspect | Official REST | This library (web-scraper) |
-|---|---|---|
-| Auth endpoint | `auth.fatturazioneelettronica.aruba.it/auth/signin` (OAuth2 password grant) | `loginfatturazione.aruba.it` (Keycloak OIDC + PKCE) |
-| Data endpoint | `ws.fatturazioneelettronica.aruba.it/services/invoice/in/*` | `fatturazioneelettronica.aruba.it/services/FatturaRicevutaFrontEnd/*` |
-| Required permission | **API access / deleghe utente** (gated) | Web login only (universal) |
-| Token lifecycle | access 30 min + refresh 60 min | Session cookie in-memory per call |
-| Payload | Includes FatturaPA XML base64 in `file` | Metadata + on-demand XML extraction |
-| Server-side filters | `startDate` + `endDate` precise | Fiscal year only (date filter applied client-side) |
-| Pagination | `?page=&size=` (cap 100/page × 10 pages = 1000) | `PageSize: null` → full year in one response |
-| Anti-bot | Documented 12 find req/min/IP | Akamai CDN only (no public rate limit) |
+For a side-by-side comparison with Aruba's official REST client (auth endpoints, pagination model, anti-bot posture), see the [README](../README.md#comparison-with-the-official-rest-client).
 
 ## Project structure
 
@@ -136,8 +125,8 @@ Backlog for when requirements or problems emerge:
 aruba-fe-client/
 ├── src/
 │   ├── auth.cjs                 Keycloak OIDC + session validation
-│   ├── api.cjs                  Portal calls + session-info cache
-│   ├── models.cjs               Item → Fattura mapper + Aruba date parser
+│   ├── api.cjs                  Portal calls (search + XML extract) + session-info cache
+│   ├── models.cjs               Item → Fattura mappers (passive + active) + date parser
 │   ├── fatturaPaParser.cjs      Slim FatturaPA v1.2 XML parser (cheerio)
 │   ├── config.cjs               URLs + timeouts (no env vars)
 │   ├── getGot.cjs               ESM-import shim for got@14 from CJS
@@ -148,8 +137,10 @@ aruba-fe-client/
 ├── docs/
 │   └── ARCHITECTURE.md          This file
 ├── README.md                    Quick start + API reference + failure modes
+├── CHANGELOG.md                 Version history + migration notes
+├── CONTRIBUTING.md              Dev workflow + design constraints + PR checklist
 ├── LICENSE                      MIT
 └── package.json                 Deps: cheerio, got@14, tough-cookie@4
 ```
 
-No build step. Pure CJS, tests run with `node` directly (no test runner).
+No build step. Pure CommonJS, tests run with `node` directly (no test runner).
