@@ -1,0 +1,44 @@
+{
+  "name": "aruba-fe-client",
+  "version": "1.0.0",
+  "description": "Pure-HTTP client for Aruba Fatturazione Elettronica (Italian SDI passive invoices). Bypasses the 'deleghe utente' REST gate by reusing the web portal's Keycloak OIDC + advancedSearch endpoint.",
+  "main": "src/index.cjs",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/fatturaPaParser.test.cjs && node tests/models.test.cjs",
+    "test:parser": "node tests/fatturaPaParser.test.cjs",
+    "test:models": "node tests/models.test.cjs"
+  },
+  "keywords": [
+    "aruba",
+    "fatturazione-elettronica",
+    "fatturapa",
+    "sdi",
+    "invoice",
+    "italy",
+    "scraper",
+    "keycloak"
+  ],
+  "author": "Alfio Caprino",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acaprino/aruba-fe-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/acaprino/aruba-fe-client/issues"
+  },
+  "homepage": "https://github.com/acaprino/aruba-fe-client#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "got": "^14.6.6",
+    "tough-cookie": "^4.1.4"
+  }
+}
