@@ -4,6 +4,8 @@ Pure-HTTP client for **Aruba Fatturazione Elettronica** — downloads received (
 
 The library reuses the same Keycloak OIDC login + internal `advancedSearch` endpoint that the Aruba web portal uses, so the same web credentials that work for `fatturazioneelettronica.aruba.it` work here.
 
+For HTTP-flow diagrams, design decisions (UTC date handling, 5-min `session-info` cache, regex namespace stripping, …), and roadmap, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## Why this exists
 
 Aruba's official REST API (`ws.fatturazioneelettronica.aruba.it`) sits behind the **"deleghe utente" / API access** flag, which many commercial plans don't include. In production you'll see:
